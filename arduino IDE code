@@ -1,0 +1,265 @@
+#include <WiFi.h>
+#include <Wire.h>
+#include <MPU6050.h>
+#include <Firebase_ESP_Client.h>
+#include "addons/TokenHelper.h"
+#include "addons/RTDBHelper.h"
+
+#define WIFI_SSID      "only for beggars by sj"
+#define WIFI_PASSWORD  "hotspotbySJ"
+#define API_KEY        "AIzaSyA58jVmTx9iSJZBRXFE7A9YjteIbZS21EU"
+#define DATABASE_URL   "https://esp-fall-detection-default-rtdb.asia-southeast1.firebasedatabase.app"
+#define USER_EMAIL     "ayansharma2589@gmail.com"
+#define USER_PASSWORD  "RamRam@05"
+#define DEVICE_ID      "elder_01"
+
+#define FALL_ACCEL_THRESHOLD   2.5    
+#define STILL_ACCEL_THRESHOLD  0.3    
+#define STILL_DURATION_MS      2000 
+#define RECOVERY_THRESHOLD     1.2    
+
+#define SENSOR_READ_MS    100    
+#define DATA_PUSH_MS      500    
+#define STATUS_PUSH_MS    10000 
+
+FirebaseData   fbdo;
+FirebaseAuth   auth;
+FirebaseConfig config;
+
+MPU6050 mpu(0x68);
+
+float ax, ay, az;      
+float gx, gy, gz;     
+float totalAccel;    
+
+enum FallState {
+  MONITORING,          
+  IMPACT_DETECTED,       
+  FALL_CONFIRMED        
+};
+FallState fallState = MONITORING;
+unsigned long impactTime = 0;
+
+unsigned long lastSensorRead = 0;
+unsigned long lastDataPush   = 0;
+unsigned long lastStatusPush = 0;
+
+bool firebaseReady = false;
+
+const String BASE_PATH    = "/board1/outputs/sensors/mpu6050/";
+const String FALL_PATH    = "/board1/fall_event/";
+const String STATUS_PATH  = "/board1/status/";
+
+#define MPU6050_ADDR      0x68
+#define REG_PWR_MGMT_1    0x6B
+#define REG_ACCEL_CONFIG  0x1C
+#define REG_GYRO_CONFIG   0x1B
+
+void initMPU6050() {
+  Wire.begin(21, 22);  
+
+  Wire.beginTransmission(MPU6050_ADDR);
+  Wire.write(REG_PWR_MGMT_1);
+  Wire.write(0x00);
+  Wire.endTransmission(true);
+
+  Wire.beginTransmission(MPU6050_ADDR);
+  Wire.write(REG_ACCEL_CONFIG);
+  Wire.write(0x10);
+  Wire.endTransmission(true);
+
+  Wire.beginTransmission(MPU6050_ADDR);
+  Wire.write(REG_GYRO_CONFIG);
+  Wire.write(0x08);
+  Wire.endTransmission(true);
+
+  mpu.initialize();
+  if (mpu.testConnection()) {
+    Serial.println("[MPU6050] Connected OK — range: ±8g / ±500dps");
+  } else {
+    Serial.println("[MPU6050] FAILED — check wiring: VCC->3.3V GND->GND SDA->21 SCL->22");
+    while (true);  
+  }
+}
+
+#define REG_ACCEL_XOUT_H  0x3B
+
+void readMPU6050() {
+  Wire.beginTransmission(MPU6050_ADDR);
+  Wire.write(REG_ACCEL_XOUT_H);
+  Wire.endTransmission(false);
+  Wire.requestFrom(MPU6050_ADDR, 14, true);
+
+  int16_t raw_ax = Wire.read() << 8 | Wire.read();
+  int16_t raw_ay = Wire.read() << 8 | Wire.read();
+  int16_t raw_az = Wire.read() << 8 | Wire.read();
+  Wire.read(); Wire.read();   // skip temperature bytes
+  int16_t raw_gx = Wire.read() << 8 | Wire.read();
+  int16_t raw_gy = Wire.read() << 8 | Wire.read();
+  int16_t raw_gz = Wire.read() << 8 | Wire.read();
+
+  ax = raw_ax / 4096.0;
+  ay = raw_ay / 4096.0;
+  az = raw_az / 4096.0;
+  gx = raw_gx / 65.5;
+  gy = raw_gy / 65.5;
+  gz = raw_gz / 65.5;
+
+  totalAccel = sqrt(ax*ax + ay*ay + az*az);
+}
+
+void printSensorValues() {
+  Serial.println("--------------------------------------------");
+  Serial.printf("  Accel X : %7.3f g\n",     ax);
+  Serial.printf("  Accel Y : %7.3f g\n",     ay);
+  Serial.printf("  Accel Z : %7.3f g\n",     az);
+  Serial.printf("  Gyro  X : %7.3f deg/s\n", gx);
+  Serial.printf("  Gyro  Y : %7.3f deg/s\n", gy);
+  Serial.printf("  Gyro  Z : %7.3f deg/s\n", gz);
+  Serial.printf("  Total g : %7.3f g\n",     totalAccel);
+  Serial.println("--------------------------------------------");
+}
+
+void pushSensorData() {
+  if (!firebaseReady || !Firebase.ready()) return;
+
+  bool ok =
+    Firebase.RTDB.setFloat(&fbdo, BASE_PATH + "accel_x", ax)    &&
+    Firebase.RTDB.setFloat(&fbdo, BASE_PATH + "accel_y", ay)    &&
+    Firebase.RTDB.setFloat(&fbdo, BASE_PATH + "accel_z", az)    &&
+    Firebase.RTDB.setFloat(&fbdo, BASE_PATH + "gyro_x",  gx)    &&
+    Firebase.RTDB.setFloat(&fbdo, BASE_PATH + "gyro_y",  gy)    &&
+    Firebase.RTDB.setFloat(&fbdo, BASE_PATH + "gyro_z",  gz)    &&
+    Firebase.RTDB.setFloat(&fbdo, BASE_PATH + "total_g", totalAccel);
+
+  if (!ok) Serial.println("[Firebase] Sensor push FAILED: " + fbdo.errorReason());
+  else     Serial.println("[Firebase] Sensor data pushed OK");
+}
+
+void pushFallAlert() {
+  if (!firebaseReady || !Firebase.ready()) return;
+
+  bool ok =
+    Firebase.RTDB.setString(&fbdo, FALL_PATH + "device_id",  DEVICE_ID)     &&
+    Firebase.RTDB.setString(&fbdo, FALL_PATH + "event",      "FALL")         &&
+    Firebase.RTDB.setString(&fbdo, FALL_PATH + "confidence", "HIGH")         &&
+    Firebase.RTDB.setFloat (&fbdo, FALL_PATH + "ax",         ax)             &&
+    Firebase.RTDB.setFloat (&fbdo, FALL_PATH + "ay",         ay)             &&
+    Firebase.RTDB.setFloat (&fbdo, FALL_PATH + "az",         az)             &&
+    Firebase.RTDB.setFloat (&fbdo, FALL_PATH + "total_g",    totalAccel)     &&
+    Firebase.RTDB.setInt   (&fbdo, FALL_PATH + "timestamp",  (int)millis());
+
+  if (!ok) Serial.println("[Firebase] Fall alert push FAILED: " + fbdo.errorReason());
+  else     Serial.println("[Firebase] *** FALL ALERT pushed to Firebase ***");
+}
+
+void pushStatus(const char* statusMsg) {
+  if (!firebaseReady || !Firebase.ready()) return;
+
+  Firebase.RTDB.setString(&fbdo, STATUS_PATH + "device_id", DEVICE_ID);
+  Firebase.RTDB.setString(&fbdo, STATUS_PATH + "status",    statusMsg);
+  Firebase.RTDB.setInt   (&fbdo, STATUS_PATH + "uptime_ms", (int)millis());
+
+  Serial.printf("[Firebase] Status pushed: %s\n", statusMsg);
+}
+
+void runFallDetection() {
+  switch (fallState) {
+
+    case MONITORING:
+      if (totalAccel > FALL_ACCEL_THRESHOLD) {
+        Serial.printf("[FALL] Impact spike! Total accel: %.2fg\n", totalAccel);
+        fallState  = IMPACT_DETECTED;
+        impactTime = millis();
+      }
+      break;
+
+    case IMPACT_DETECTED:
+      if (totalAccel < STILL_ACCEL_THRESHOLD) {
+        if (millis() - impactTime >= STILL_DURATION_MS) {
+          Serial.println("[FALL] CONFIRMED — person still after impact!");
+          pushFallAlert();
+          fallState = FALL_CONFIRMED;
+        }
+      } else if (totalAccel > 0.8 && millis() - impactTime > 3000) {
+        // Person moving normally — was just a bump, not a fall
+        Serial.println("[FALL] False alarm — person moving. Resetting.");
+        fallState = MONITORING;
+      }
+      break;
+
+    case FALL_CONFIRMED:
+      if (totalAccel > RECOVERY_THRESHOLD) {
+        Serial.println("[FALL] Movement detected — resetting to MONITORING.");
+        fallState = MONITORING;
+        pushStatus("recovered");
+      }
+      break;
+  }
+}
+
+void setup() {
+  Serial.begin(115200);
+  delay(1000);
+  Serial.println("\n========================================");
+  Serial.println("  ELDERLY FALL DETECTION SYSTEM");
+  Serial.println("  ESP32 + MPU6050 + Firebase");
+  Serial.println("========================================\n");
+
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+  Serial.print("[WiFi] Connecting");
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(400); Serial.print(".");
+  }
+  Serial.println("\n[WiFi] Connected! IP: " + WiFi.localIP().toString());
+
+  // 2. MPU6050
+  initMPU6050();
+
+  config.api_key      = API_KEY;
+  config.database_url = DATABASE_URL;
+  auth.user.email     = USER_EMAIL;
+  auth.user.password  = USER_PASSWORD;
+  config.token_status_callback = tokenStatusCallback;
+  config.max_token_generation_retry = 5;
+
+  Firebase.begin(&config, &auth);
+  Firebase.reconnectWiFi(true);
+
+  Serial.print("[Firebase] Authenticating");
+  unsigned long authStart = millis();
+  while (!Firebase.ready() && millis() - authStart < 15000) {
+    Serial.print("."); delay(500);
+  }
+
+  if (Firebase.ready()) {
+    firebaseReady = true;
+    Serial.println("\n[Firebase] Auth OK!");
+    pushStatus("online");
+  } else {
+    Serial.println("\n[Firebase] Auth FAILED — check API key / credentials");
+  }
+
+  Serial.println("\n[SYSTEM] Ready. Monitoring for falls...\n");
+}
+
+void loop() {
+  unsigned long now = millis();
+
+  if (now - lastSensorRead >= SENSOR_READ_MS) {
+    lastSensorRead = now;
+    readMPU6050();
+    runFallDetection();
+  }
+
+  if (now - lastDataPush >= DATA_PUSH_MS) {
+    lastDataPush = now;
+    printSensorValues();
+    pushSensorData();
+  }
+
+  if (now - lastStatusPush >= STATUS_PUSH_MS) {
+    lastStatusPush = now;
+    pushStatus("online");
+  }
+}
